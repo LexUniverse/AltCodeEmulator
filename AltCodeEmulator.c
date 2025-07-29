@@ -3,10 +3,28 @@
 
 #include <windows.h>
 #include <stdbool.h>
+#include <time.h>
+#include <stdio.h>
 
-char buffer[10];
+// Глобальные переменные
+char buffer[10] = {0};
 int bufferLen = 0;
-bool shiftPressed = false;
+bool altEmulationMode = false;
+clock_t firstCtrlPressTime = 0;
+bool waitingForSecondCtrl = false;
+bool ctrlKeyWasDown = false;
+
+void LogToFile(const char* message) {
+    FILE* logFile = fopen("AltCodeEmulator.log", "a");
+    if (logFile) {
+        time_t now;
+        time(&now);
+        char timeStr[20];
+        strftime(timeStr, sizeof(timeStr), "%H:%M:%S", localtime(&now));
+        fprintf(logFile, "[%s] %s\n", timeStr, message);
+        fclose(logFile);
+    }
+}
 
 wchar_t Windows1252ToUnicode(unsigned char code) {
     wchar_t wc[2] = { 0 };
@@ -52,36 +70,82 @@ void InsertUnicodeChar(wchar_t wc) {
     SendInput(4, inputs, sizeof(INPUT));
 }
 
+bool IsCtrlReallyDown() {
+    return (GetAsyncKeyState(VK_RCONTROL) & 0x8000) != 0;
+}
+
+void CheckForTimeout() {
+    if (waitingForSecondCtrl && !altEmulationMode) {
+        clock_t currentTime = clock();
+        double elapsedTime = (double)(currentTime - firstCtrlPressTime) / CLOCKS_PER_SEC;
+
+        if (elapsedTime >= 0.5) {
+            LogToFile("Timeout reached. Single Ctrl press.");
+            waitingForSecondCtrl = false;
+        }
+    }
+}
+
 LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
     if (nCode == HC_ACTION) {
         KBDLLHOOKSTRUCT* p = (KBDLLHOOKSTRUCT*)lParam;
         DWORD vkCode = p->vkCode;
 
-        if (wParam == WM_KEYDOWN) {
-            if (vkCode == VK_RSHIFT && !shiftPressed) {
-                shiftPressed = true;
-                bufferLen = 0;
-                return 1; // Block RShift down
-            } else if (shiftPressed && vkCode >= '0' && vkCode <= '9' && bufferLen < 10) {
-                buffer[bufferLen++] = (char)vkCode;
-                return 1; // Block digit keys
-            }
-        }
+        CheckForTimeout();
 
-        if (wParam == WM_KEYUP && vkCode == VK_RSHIFT && shiftPressed) {
-            shiftPressed = false;
-            buffer[bufferLen] = '\0';
+        if (vkCode == VK_RCONTROL) {
+            if (wParam == WM_KEYDOWN) {
+                if (!ctrlKeyWasDown) {
+                    ctrlKeyWasDown = true;
+                    clock_t currentTime = clock();
 
-            if (bufferLen > 0) {
-                int code = atoi(buffer);
-                if (code >= 0 && code <= 255) {
-                    wchar_t wc = Windows1252ToUnicode((unsigned char)code);
-                    InsertUnicodeChar(wc);
+                    if (waitingForSecondCtrl) {
+                        double elapsedTime = (double)(currentTime - firstCtrlPressTime) / CLOCKS_PER_SEC;
+                        if (elapsedTime < 0.5) {
+                            LogToFile("Double Ctrl detected! Entering Alt-code mode.");
+                            altEmulationMode = true;
+                            waitingForSecondCtrl = false;
+                            return 1;
+                        }
+                    }
+                    else {
+                        LogToFile("First Ctrl pressed. Waiting for second press...");
+                        waitingForSecondCtrl = true;
+                        firstCtrlPressTime = currentTime;
+                    }
                 }
             }
+            else if (wParam == WM_KEYUP) {
+                ctrlKeyWasDown = false;
 
-            bufferLen = 0;
-            return 1; // Block RShift up
+                if (altEmulationMode) {
+                    if (bufferLen > 0) {
+                        buffer[bufferLen] = '\0';
+                        int code = atoi(buffer);
+                        if (code >= 0 && code <= 255) {
+                            wchar_t wc = Windows1252ToUnicode((unsigned char)code);
+                            InsertUnicodeChar(wc);
+
+                            char logMsg[50];
+                            snprintf(logMsg, sizeof(logMsg), "Sent Alt code: %s (%d)", buffer, code);
+                            LogToFile(logMsg);
+                        }
+                    }
+                    bufferLen = 0;
+                    altEmulationMode = false;
+                    LogToFile("Alt-code mode exited.");
+                    return 1;
+                }
+            }
+        }
+        else if (altEmulationMode && wParam == WM_KEYDOWN) {
+            if (vkCode >= '0' && vkCode <= '9' && bufferLen < 9) {
+                buffer[bufferLen++] = (char)vkCode;
+                char logMsg[50];
+                snprintf(logMsg, sizeof(logMsg), "Digit pressed: %c", (char)vkCode);
+                LogToFile(logMsg);
+                return 1;
+            }
         }
     }
 
@@ -89,8 +153,13 @@ LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
 }
 
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine, int nCmdShow) {
+    LogToFile("=== AltCodeEmulator started ===");
+
     HHOOK hook = SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc, NULL, 0);
-    if (!hook) return 1;
+    if (!hook) {
+        LogToFile("ERROR: Failed to set keyboard hook!");
+        return 1;
+    }
 
     MSG msg;
     while (GetMessageW(&msg, NULL, 0, 0)) {
@@ -99,5 +168,6 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     }
 
     UnhookWindowsHookEx(hook);
+    LogToFile("=== AltCodeEmulator stopped ===");
     return 0;
 }
